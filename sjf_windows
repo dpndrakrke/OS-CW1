@@ -1,0 +1,188 @@
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+#define N 7
+#define UNIT_MS 200
+
+typedef struct {
+    char pid[6];
+    char task[40];
+    int at, bt, pr;
+
+    int ct, tat, wt;
+
+    double pct_ms;  // elapsed run time (per task)
+    double cpu_ms;  // CPU time used (per task)
+    int done;
+} Proc;
+
+static Proc p[N] = {
+    {"P1", "Balance Inquiry",         0, 2, 3, 0,0,0, 0,0, 0},
+    {"P2", "Normal Transfer",         1, 4, 2, 0,0,0, 0,0, 0},
+    {"P3", "Salary Batch",            2, 8, 1, 0,0,0, 0,0, 0},
+    {"P4", "Fraud Check",             3, 3, 1, 0,0,0, 0,0, 0},
+    {"P5", "Audit Logging",           4, 2, 4, 0,0,0, 0,0, 0},
+    {"P6", "International Transfer",  5, 6, 2, 0,0,0, 0,0, 0},
+    {"P7", "OTP Verification",        6, 1, 1, 0,0,0, 0,0, 0}
+};
+
+static double now_ms(void) {
+    static LARGE_INTEGER freq;
+    static int init = 0;
+    LARGE_INTEGER counter;
+
+    if (!init) {
+        QueryPerformanceFrequency(&freq);
+        init = 1;
+    }
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+// Total CPU time used by *this process* so far (kernel+user) in ms
+static double read_process_cpu_ms(void) {
+    FILETIME create, exit, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user)) {
+        return 0.0;
+    }
+
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;   u.HighPart = user.dwHighDateTime;
+
+    return (double)(k.QuadPart + u.QuadPart) / 10000.0; // 100ns -> ms
+}
+
+static void busy_work_ms(int ms) {
+    double start = now_ms();
+    while ((now_ms() - start) < (double)ms) {
+        MemoryBarrier();
+    }
+}
+
+// Find index of next process using Non-preemptive SJF:
+// among processes with at <= current_time and not done, choose smallest bt.
+// If none are ready, return -1.
+static int pick_sjf(int current_time) {
+    int idx = -1;
+    int best_bt = 0;
+
+    for (int i = 0; i < N; i++) {
+        if (!p[i].done && p[i].at <= current_time) {
+            if (idx == -1 || p[i].bt < best_bt) {
+                idx = i;
+                best_bt = p[i].bt;
+            } else if (p[i].bt == best_bt) {
+                // Tie-breaker (keeps it deterministic): earlier arrival wins
+                if (p[i].at < p[idx].at) idx = i;
+            }
+        }
+    }
+    return idx;
+}
+
+// Find next earliest arrival among not-done processes
+static int next_arrival_time(void) {
+    int t = -1;
+    for (int i = 0; i < N; i++) {
+        if (!p[i].done) {
+            if (t == -1 || p[i].at < t) t = p[i].at;
+        }
+    }
+    return t;
+}
+
+int main(void) {
+    int completed = 0;
+    int current_time = 0;
+    int sim_ctx = 0; // algorithmic context switches (between jobs that run)
+
+    double total_tat = 0, total_wt = 0;
+    double total_cpu = 0;
+
+    double program_start = now_ms();
+
+    printf("===== SJF Scheduling (Windows, Non-Preemptive) =====\n\n");
+
+    // ---------------- Gantt Chart ----------------
+    printf("Gantt Chart:\n");
+    printf("0 ");
+
+    int first_job = 1;
+
+    while (completed < N) {
+        int idx = pick_sjf(current_time);
+
+        if (idx == -1) {
+            // No job ready, CPU is idle until the next arrival
+            int na = next_arrival_time();
+            if (na > current_time) {
+                printf("| IDLE %d ", na);
+                current_time = na;
+            }
+            continue;
+        }
+
+        // Context switch count: count transitions between executed jobs
+        if (!first_job) sim_ctx++;
+        first_job = 0;
+
+        printf("| %s ", p[idx].task);
+
+        double cpu_before = read_process_cpu_ms();
+        double start = now_ms();
+
+        busy_work_ms(p[idx].bt * UNIT_MS);
+
+        double end = now_ms();
+        double cpu_after = read_process_cpu_ms();
+
+        p[idx].pct_ms = end - start;
+        p[idx].cpu_ms = cpu_after - cpu_before;
+
+        // SJF math
+        current_time += p[idx].bt;
+        p[idx].ct  = current_time;
+        p[idx].tat = p[idx].ct - p[idx].at;
+        p[idx].wt  = p[idx].tat - p[idx].bt;
+
+        p[idx].done = 1;
+        completed++;
+
+        printf("%d ", current_time);
+    }
+
+    printf("|\n\n");
+
+    // ---------------- Results Table ----------------
+    printf("PID\tTask Type\t\t\tAT\tBT\tCT\tTAT\tWT\tPCT(ms)\tCPU(ms)\n");
+
+    for (int i = 0; i < N; i++) {
+        printf("%s\t%-24s\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.2f\n",
+               p[i].pid,
+               p[i].task,
+               p[i].at, p[i].bt,
+               p[i].ct, p[i].tat, p[i].wt,
+               p[i].pct_ms,
+               p[i].cpu_ms);
+
+        total_tat += p[i].tat;
+        total_wt  += p[i].wt;
+        total_cpu += p[i].cpu_ms;
+    }
+
+    // ---------------- Algorithm Metrics ----------------
+    printf("\nAlgorithm Metrics:\n");
+    printf("Average Turnaround Time: %.2f\n", total_tat / N);
+    printf("Average Waiting Time: %.2f\n", total_wt / N);
+    printf("Simulated Context Switches: %d\n", sim_ctx);
+
+    // ---------------- OS Metrics ----------------
+    double program_end = now_ms();
+    printf("\nOperating System Metrics:\n");
+    printf("Total Program Completion Time: %.2f ms\n", program_end - program_start);
+    printf("Total CPU Execution Time: %.2f ms\n", total_cpu);
+
+    return 0;
+}
